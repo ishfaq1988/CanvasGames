@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Canvas Games</title>
+<style>
+  :root { --bg:#05060d; --card:#0d1022; --line:rgba(120,150,255,.22); --text:#e8ecff; --muted:#9aa3c7; --accent:#6af; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width:1100px; margin:0 auto; padding:32px 16px 64px; }
+  h1 { font-size:clamp(30px,5vw,46px); margin:0 0 6px; background:linear-gradient(90deg,#4cf,#a6f,#f5a); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .lead { color:var(--muted); max-width:720px; margin:0 0 28px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; overflow:hidden; display:flex; flex-direction:column; }
+  .card .thumb { aspect-ratio:16/10; background:#070914; display:flex; align-items:center; justify-content:center; font-size:56px; }
+  .card .body { padding:14px 16px 16px; flex:1; display:flex; flex-direction:column; }
+  .card h2 { margin:0 0 4px; font-size:19px; }
+  .card p { margin:0 0 12px; color:var(--muted); font-size:14px; flex:1; }
+  .btns { display:flex; gap:8px; }
+  .btn { flex:1; text-align:center; padding:9px 10px; border-radius:9px; border:1px solid rgba(120,160,255,.35); background:#151c3d; color:#fff; text-decoration:none; font-weight:600; font-size:14px; cursor:pointer; font-family:inherit; }
+  .btn:hover { border-color:var(--accent); }
+  .demo { margin-top:40px; }
+  .demo h2 { margin:0 0 8px; }
+  .frame { width:100%; aspect-ratio:16/10; border:1px solid var(--line); border-radius:14px; overflow:hidden; background:#000; }
+  .frame iframe { width:100%; height:100%; border:0; display:block; }
+  pre { background:#0a0d1c; border:1px solid var(--line); border-radius:10px; padding:14px; overflow:auto; font-size:13px; color:#cfe0ff; }
+  .how { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; margin-top:12px; }
+  .how div { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; }
+  .how h3 { margin:0 0 4px; font-size:16px; }
+  .how p { margin:0; color:var(--muted); font-size:14px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Canvas Games</h1>
+  <p class="lead">Four HTML5 canvas games. Play against the computer, or play a friend on another device over a direct
+    peer-to-peer connection. There's no game server, and each game is one file you can drop into any website.</p>
+
+  <div class="grid" id="games"></div>
+
+  <section class="demo">
+    <h2>Embedded demo</h2>
+    <p class="lead">This is the same game inside an <code>&lt;iframe&gt;</code>, which is exactly how you'd put it on your own site.</p>
+    <div class="frame"><iframe id="demo" src="games/pong.html" title="Game demo" allow="clipboard-write; fullscreen; web-share"></iframe></div>
+    <pre id="snippet"></pre>
+  </section>
+
+  <section class="demo">
+    <h2>How online play works</h2>
+    <div class="how">
+      <div><h3>1 · Create a game</h3><p>The host gets a short room code and a link to share.</p></div>
+      <div><h3>2 · Find each other</h3><p>Free public Nostr relays pass a one-time encrypted handshake. Prefer zero relays? Use the copy-paste codes option.</p></div>
+      <div><h3>3 · Play direct</h3><p>A WebRTC data channel links the two browsers. All game data goes device to device.</p></div>
+    </div>
+  </section>
+</main>
+<script>
+  var GAMES = [
+    { file: 'pong', title: 'Neon Pong', icon: '🏓', text: 'The classic. Hit angles off your paddle, and the ball speeds up every rally.' },
+    { file: 'airhockey', title: 'Neon Air Hockey', icon: '🥅', text: 'Fast puck physics. Online, each player sees their own goal at the bottom.' },
+    { file: 'tron', title: 'Light Cycles', icon: '🏍️', text: 'Box your opponent in with your light trail. Swipe to steer on phones.' },
+    { file: 'tanks', title: 'Tank Duel', icon: '🛡️', text: 'Bank shots off the walls across three arenas. Bullets bounce twice.' }
+  ];
+  var grid = document.getElementById('games');
+  var demo = document.getElementById('demo');
+  var snippet = document.getElementById('snippet');
+  function setSnippet(file) {
+    snippet.textContent = '<iframe src="https://YOUR-SITE/canvasgames/games/' + file + '.html"\n' +
+      '        width="800" height="500" style="border:0"\n' +
+      '        allow="clipboard-write; fullscreen; web-share"></iframe>';
+  }
+  GAMES.forEach(function (g) {
+    var card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML = '<div class="thumb"></div><div class="body"><h2></h2><p></p>' +
+      '<div class="btns"><a class="btn play">Play</a><button class="btn embed" type="button">Show embedded</button></div></div>';
+    card.querySelector('.thumb').textContent = g.icon;
+    card.querySelector('h2').textContent = g.title;
+    card.querySelector('p').textContent = g.text;
+    card.querySelector('.play').href = 'games/' + g.file + '.html';
+    card.querySelector('.embed').addEventListener('click', function () {
+      demo.src = 'games/' + g.file + '.html';
+      setSnippet(g.file);
+      demo.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+    grid.appendChild(card);
+  });
+  setSnippet('pong');
+</script>
+</body>
+</html>

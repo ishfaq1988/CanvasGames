@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Light Cycles</title>
+<style>html,body{margin:0;height:100%;background:#05060d}#game{position:fixed;inset:0}</style>
+</head>
+<body>
+<div id="game"></div>
+<script src="../lib/p2p.js"></script>
+<script src="../lib/shell.js"></script>
+<script>
+(function () {
+  'use strict';
+  var COLS = 80, ROWS = 50, CELL = 10;
+  var W = COLS * CELL, H = ROWS * CELL;
+  var MOVE_TIME = 1 / 15;
+  var ROUND_PAUSE = 1.8;
+  var WIN_ROUNDS = 5;
+  var DX = [0, 1, 0, -1], DY = [-1, 0, 1, 0];
+  var DIRS = { up: 0, right: 1, down: 2, left: 3 };
+  var COLORS = ['#3cf', '#fa3'];
+  var INPUT_TTL_MS = 250;
+
+  function idx(x, y) { return y * COLS + x; }
+
+  function newRound(s) {
+    s.grid = new Uint8Array(COLS * ROWS);
+    s.trail = [];
+    s.acc = 0;
+    s.pause = 0;
+    s.roundWinner = null;
+    s.bikes = [
+      { x: 14, y: ROWS >> 1, d: 1, alive: true, q: [], seq: s.bikes ? s.bikes[0].seq : 0 },
+      { x: COLS - 15, y: ROWS >> 1, d: 3, alive: true, q: [], seq: s.bikes ? s.bikes[1].seq : 0 }
+    ];
+    s.bikes.forEach(function (b, i) { mark(s, b.x, b.y, i); });
+  }
+
+  function mark(s, x, y, p) {
+    s.grid[idx(x, y)] = p + 1;
+    s.trail.push(x, y, p);
+  }
+
+  function blocked(s, x, y) {
+    return x < 0 || y < 0 || x >= COLS || y >= ROWS || s.grid[idx(x, y)] !== 0;
+  }
+
+  // Queue turns from an input's recent key history; ignore ones already seen.
+  function takeInput(s, i, inp, queue) {
+    var b = s.bikes[i];
+    if (!inp) return;
+    if (inp.dir !== undefined) { if (queue) b.q = [inp.dir]; return; }
+    (inp.h || []).forEach(function (e) {
+      if (e[0] > b.seq) {
+        b.seq = e[0];
+        if (queue && b.q.length < 3 && e[1] >= 0 && e[1] < 4) b.q.push(e[1]);
+      }
+    });
+  }
+
+  function advance(s, api) {
+    var next = [];
+    s.bikes.forEach(function (b) {
+      while (b.q.length) {
+        var nd = b.q.shift();
+        if (nd !== b.d && nd !== (b.d + 2) % 4) { b.d = nd; break; }
+      }
+      next.push({ x: b.x + DX[b.d], y: b.y + DY[b.d] });
+    });
+    var dead = [blocked(s, next[0].x, next[0].y), blocked(s, next[1].x, next[1].y)];
+    if (next[0].x === next[1].x && next[0].y === next[1].y) dead = [true, true];
+    s.bikes.forEach(function (b, i) {
+      if (dead[i]) { b.alive = false; return; }
+      b.x = next[i].x; b.y = next[i].y;
+      mark(s, b.x, b.y, i);
+    });
+    if (dead[0] || dead[1]) {
+      s.pause = ROUND_PAUSE;
+      if (dead[0] && dead[1]) s.roundWinner = 'draw';
+      else { s.roundWinner = dead[0] ? 1 : 0; s.score[s.roundWinner]++; }
+      api.sfx('crash');
+    } else {
+      s.ticks++;
+    }
+  }
+
+  // --- CPU: pick the turn that leaves the most open space ---------------------
+  var seen = new Uint32Array(COLS * ROWS), stamp = 0, queue = new Int32Array(COLS * ROWS);
+  function openArea(s, sx, sy, limit, avoid) {
+    if (blocked(s, sx, sy)) return -1;
+    stamp++;
+    var head = 0, tail = 0, count = 0;
+    queue[tail++] = idx(sx, sy);
+    seen[idx(sx, sy)] = stamp;
+    if (avoid) avoid.forEach(function (c) { if (c.x >= 0 && c.y >= 0 && c.x < COLS && c.y < ROWS) seen[idx(c.x, c.y)] = stamp; });
+    while (head < tail && count < limit) {
+      var c = queue[head++], x = c % COLS, y = (c / COLS) | 0;
+      count++;
+      for (var d = 0; d < 4; d++) {
+        var nx = x + DX[d], ny = y + DY[d];
+        if (nx < 0 || ny < 0 || nx >= COLS || ny >= ROWS) continue;
+        var n = idx(nx, ny);
+        if (seen[n] === stamp || s.grid[n]) continue;
+        seen[n] = stamp;
+        queue[tail++] = n;
+      }
+    }
+    return count;
+  }
+
+  // Per-scheme key history so remote and local inputs survive dropped frames.
+  var history = {};
+  var seqCounter = Date.now() % 100000;
+
+  var def = {
+    id: 'tron',
+    title: 'Light Cycles',
+    tagline: 'Never touch a wall or a trail. First to ' + WIN_ROUNDS + ' rounds.',
+    width: W,
+    height: H,
+    players: [{ name: 'Cyan', color: COLORS[0], side: 'left' }, { name: 'Amber', color: COLORS[1], side: 'right' }],
+    controls: {
+      cpu: 'WASD or arrows · swipe on touch screens',
+      local: 'Cyan WASD · Amber arrows',
+      online: 'WASD or arrows · swipe on touch screens'
+    },
+    sounds: {
+      turn: [240, 0.03, 'square', 0.03],
+      crash: [140, 0.6, 'sawtooth', 0.09, 40],
+      go: [660, 0.15, 'triangle', 0.08],
+      win: [440, 0.6, 'triangle', 0.09, 880]
+    },
+
+    init: function () {
+      var s = { gid: Math.random().toString(36).slice(2, 8), round: 1, score: [0, 0], ticks: 0 };
+      newRound(s);
+      return s;
+    },
+
+    readInput: function (inp) {
+      var hst = history[inp.scheme] || (history[inp.scheme] = []);
+      var now = performance.now();
+      inp.taps().forEach(function (name) {
+        if (DIRS[name] !== undefined) hst.push([++seqCounter, DIRS[name], now]);
+      });
+      while (hst.length && (hst.length > 4 || now - hst[0][2] > INPUT_TTL_MS)) hst.shift();
+      return { h: hst.map(function (e) { return [e[0], e[1]]; }) };
+    },
+
+    ai: function (s, i) {
+      if (s.aiTick === s.ticks && s.aiDir !== undefined) return { dir: s.aiDir };
+      var b = s.bikes[i], o = s.bikes[1 - i];
+      var opts = [b.d, (b.d + 3) % 4, (b.d + 1) % 4];
+      // Cells the opponent could step into next are risky.
+      var danger = [0, 1, 2, 3].map(function (d) { return { x: o.x + DX[d], y: o.y + DY[d] }; });
+      var best = b.d, bestScore = -Infinity;
+      opts.forEach(function (d, k) {
+        var nx = b.x + DX[d], ny = b.y + DY[d];
+        var area = openArea(s, nx, ny, 600, danger);
+        if (area < 0) return;
+        var score = area + (k === 0 ? 4 : 0) + Math.random() * 3;
+        var dist = Math.abs(nx - o.x) + Math.abs(ny - o.y);
+        if (dist <= 1) score -= 50;
+        if (score > bestScore) { bestScore = score; best = d; }
+      });
+      s.aiTick = s.ticks;
+      s.aiDir = best;
+      return { dir: best };
+    },
+
+    step: function (s, inputs, dt, api) {
+      var paused = s.pause > 0;
+      for (var i = 0; i < 2; i++) {
+        var before = s.bikes[i].q.length;
+        takeInput(s, i, inputs[i], !paused);
+        if (inputs[i] && inputs[i].h && s.bikes[i].q.length > before) api.sfx('turn');
+      }
+      if (paused) {
+        s.pause -= dt;
+        if (s.pause <= 0 && def.winner(s) === null) {
+          s.round++;
+          newRound(s);
+        }
+        return;
+      }
+      s.acc += dt;
+      while (s.acc >= MOVE_TIME && s.pause <= 0) {
+        s.acc -= MOVE_TIME;
+        advance(s, api);
+      }
+    },
+
+    winner: function (s) {
+      if (s.pause > ROUND_PAUSE - 1) return null; // let the crash show first
+      if (s.score[0] >= WIN_ROUNDS) return 0;
+      if (s.score[1] >= WIN_ROUNDS) return 1;
+      return null;
+    },
+
+    // Trails only grow, so snapshots carry just the cells added since the last one.
+    snapshot: function (s) {
+      var ls = def._lastSent;
+      var from = ls && ls.gid === s.gid && ls.round === s.round ? ls.len : 0;
+      def._lastSent = { gid: s.gid, round: s.round, len: s.trail.length / 3 };
+      return {
+        g: s.gid, r: s.round, f: from, c: s.trail.slice(from * 3),
+        b: s.bikes.map(function (b) { return [b.x, b.y, b.d, b.alive ? 1 : 0]; }),
+        sc: s.score, pz: s.pause > 0 ? 1 : 0, rw: s.roundWinner
+      };
+    },
+    applySnapshot: function (prev, n) {
+      var s = prev && prev.gid === n.g && prev.round === n.r ? prev : { gid: n.g, round: n.r, trail: [] };
+      s.trail.length = n.f * 3;
+      for (var i = 0; i < n.c.length; i++) s.trail.push(n.c[i]);
+      s.bikes = n.b.map(function (b) { return { x: b[0], y: b[1], d: b[2], alive: !!b[3] }; });
+      s.score = n.sc;
+      s.pause = n.pz;
+      s.roundWinner = n.rw;
+      return s;
+    },
+
+    render: function (ctx, s, view) {
+      ctx.fillStyle = '#04060f';
+      ctx.fillRect(0, 0, W, H);
+      ctx.strokeStyle = 'rgba(90,120,255,0.07)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (var x = 0; x <= COLS; x += 2) { ctx.moveTo(x * CELL + 0.5, 0); ctx.lineTo(x * CELL + 0.5, H); }
+      for (var y = 0; y <= ROWS; y += 2) { ctx.moveTo(0, y * CELL + 0.5); ctx.lineTo(W, y * CELL + 0.5); }
+      ctx.stroke();
+
+      var t = s.trail;
+      for (var p = 0; p < 2; p++) {
+        ctx.fillStyle = COLORS[p];
+        ctx.globalAlpha = 0.75;
+        ctx.beginPath();
+        for (var i = 0; i < t.length; i += 3) {
+          if (t[i + 2] === p) ctx.rect(t[i] * CELL + 1, t[i + 1] * CELL + 1, CELL - 2, CELL - 2);
+        }
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+
+      s.bikes.forEach(function (b, i) {
+        var cx = b.x * CELL + CELL / 2, cy = b.y * CELL + CELL / 2;
+        ctx.save();
+        GameShell.utils.glow(ctx, COLORS[i], 22);
+        ctx.fillStyle = b.alive ? '#fff' : COLORS[i];
+        ctx.fillRect(b.x * CELL - 1, b.y * CELL - 1, CELL + 2, CELL + 2);
+        ctx.restore();
+        if (!b.alive && s.pause) {
+          var k = (view.now % 600) / 600;
+          ctx.strokeStyle = COLORS[i];
+          ctx.globalAlpha = 1 - k;
+          ctx.lineWidth = 3;
+          ctx.beginPath(); ctx.arc(cx, cy, 8 + k * 40, 0, Math.PI * 2); ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+      });
+    },
+
+    hud: function (ctx, s, view) {
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.font = '700 22px system-ui,sans-serif';
+      ctx.fillStyle = COLORS[0];
+      ctx.fillText(s.score[0], W / 2 - 30, 10);
+      ctx.fillStyle = 'rgba(255,255,255,0.4)';
+      ctx.fillText(':', W / 2, 10);
+      ctx.fillStyle = COLORS[1];
+      ctx.fillText(s.score[1], W / 2 + 30, 10);
+      if (view.phase === 'countdown' && (view.mode === 'host' || view.mode === 'guest')) {
+        var me = s.bikes[view.me];
+        ctx.fillStyle = COLORS[view.me];
+        ctx.font = '600 14px system-ui,sans-serif';
+        ctx.fillText('YOU', me.x * CELL + CELL / 2, me.y * CELL - 26);
+      }
+      if (s.pause && s.roundWinner !== null) {
+        var P = view.players;
+        var msg = s.roundWinner === 'draw' ? 'Head-on crash! No point.' : P[s.roundWinner].name + ' takes the round';
+        ctx.font = '700 28px system-ui,sans-serif';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = s.roundWinner === 'draw' ? '#fff' : COLORS[s.roundWinner];
+        ctx.fillText(msg, W / 2, H / 2 - 60);
+      }
+    }
+  };
+
+  GameShell.start(def, '#game');
+})();
+</script>
+</body>
+</html>

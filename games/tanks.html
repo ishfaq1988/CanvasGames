@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Tank Duel</title>
+<style>html,body{margin:0;height:100%;background:#05060d}#game{position:fixed;inset:0}</style>
+</head>
+<body>
+<div id="game"></div>
+<script src="../lib/p2p.js"></script>
+<script src="../lib/shell.js"></script>
+<script>
+(function () {
+  'use strict';
+  var U = GameShell.utils;
+  var W = 960, H = 600;
+  var TANK_R = 16, TANK_SPEED = 150, TURN_SPEED = 3.2;
+  var BULLET_R = 4, BULLET_SPEED = 380, BULLET_LIFE = 3, BULLET_BOUNCES = 2, MAX_BULLETS = 3, FIRE_CD = 0.35;
+  var ROUND_PAUSE = 1.6, WIN_SCORE = 5;
+  var COLORS = ['#3cf', '#f4a'];
+  var SPAWNS = [{ x: 60, y: H / 2, a: 0 }, { x: W - 60, y: H / 2, a: Math.PI }];
+
+  // Arenas are symmetric under a 180° turn, so neither spawn is favoured.
+  function mirror(rects) {
+    var out = rects.slice();
+    rects.forEach(function (r) { out.push([W - r[0] - r[2], H - r[1] - r[3], r[2], r[3]]); });
+    return out;
+  }
+  var MAPS = [
+    mirror([[450, 250, 30, 50], [180, 90, 30, 150], [180, 90, 140, 30], [330, 400, 160, 30], [700, 120, 30, 120]]),
+    mirror([[150, 150, 60, 60], [150, 390, 60, 60], [330, 260, 40, 80], [460, 60, 40, 140], [300, 480, 120, 30]]),
+    mirror([[120, 200, 300, 26], [420, 380, 120, 26], [250, 330, 26, 140], [700, 60, 26, 120], [460, 0, 40, 80]])
+  ];
+
+  function hitsWalls(map, x, y, r) {
+    for (var i = 0; i < map.length; i++) {
+      var w = map[i];
+      var cx = U.clamp(x, w[0], w[0] + w[2]), cy = U.clamp(y, w[1], w[1] + w[3]);
+      var dx = x - cx, dy = y - cy;
+      if (dx * dx + dy * dy < r * r) return true;
+    }
+    return x < r || y < r || x > W - r || y > H - r;
+  }
+
+  function pushOutOfWalls(map, t) {
+    for (var i = 0; i < map.length; i++) {
+      var w = map[i];
+      var cx = U.clamp(t.x, w[0], w[0] + w[2]), cy = U.clamp(t.y, w[1], w[1] + w[3]);
+      var dx = t.x - cx, dy = t.y - cy, d = Math.hypot(dx, dy);
+      if (d < TANK_R) {
+        if (d === 0) { dx = t.x < w[0] + w[2] / 2 ? -1 : 1; dy = 0; d = 1; }
+        t.x = cx + dx / d * TANK_R;
+        t.y = cy + dy / d * TANK_R;
+      }
+    }
+    t.x = U.clamp(t.x, TANK_R, W - TANK_R);
+    t.y = U.clamp(t.y, TANK_R, H - TANK_R);
+  }
+
+  function lineOfSight(map, ax, ay, bx, by) {
+    var d = Math.hypot(bx - ax, by - ay), n = Math.ceil(d / 8);
+    for (var i = 1; i < n; i++) {
+      if (hitsWalls(map, U.lerp(ax, bx, i / n), U.lerp(ay, by, i / n), BULLET_R)) return false;
+    }
+    return true;
+  }
+
+  function newRound(s) {
+    s.tanks = SPAWNS.map(function (sp) { return { x: sp.x, y: sp.y, a: sp.a, cd: 0.5, alive: true, vx: 0, vy: 0 }; });
+    s.bullets = [];
+    s.pause = 0;
+    s.roundWinner = null;
+    s.boom = null;
+  }
+
+  // --- CPU path finding on a coarse grid ---------------------------------------
+  var GS = 30, GC = W / GS, GR = H / GS;
+  var gridCache = {};
+  function navGrid(mapIdx) {
+    if (gridCache[mapIdx]) return gridCache[mapIdx];
+    var g = new Uint8Array(GC * GR);
+    for (var y = 0; y < GR; y++) for (var x = 0; x < GC; x++) {
+      g[y * GC + x] = hitsWalls(MAPS[mapIdx], x * GS + GS / 2, y * GS + GS / 2, TANK_R + 4) ? 1 : 0;
+    }
+    return (gridCache[mapIdx] = g);
+  }
+  function findPath(mapIdx, sx, sy, tx, ty) {
+    var g = navGrid(mapIdx);
+    var start = ((sy / GS) | 0) * GC + ((sx / GS) | 0), goal = ((ty / GS) | 0) * GC + ((tx / GS) | 0);
+    var prev = new Int32Array(GC * GR).fill(-1), q = [start];
+    prev[start] = start;
+    for (var h = 0; h < q.length; h++) {
+      var c = q[h];
+      if (c === goal) break;
+      var x = c % GC, y = (c / GC) | 0;
+      var nb = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+      for (var k = 0; k < 4; k++) {
+        var nx = x + nb[k][0], ny = y + nb[k][1];
+        if (nx < 0 || ny < 0 || nx >= GC || ny >= GR) continue;
+        var n = ny * GC + nx;
+        if (prev[n] !== -1 || (g[n] && n !== goal)) continue;
+        prev[n] = c;
+        q.push(n);
+      }
+    }
+    if (prev[goal] === -1) return null;
+    var path = [];
+    for (var p = goal; p !== start; p = prev[p]) path.push(p);
+    path.reverse();
+    return path.map(function (cell) { return { x: (cell % GC) * GS + GS / 2, y: ((cell / GC) | 0) * GS + GS / 2 }; });
+  }
+
+  var nextBulletId = 1;
+
+  var def = {
+    id: 'tanks',
+    title: 'Tank Duel',
+    tagline: 'Bullets bounce twice. First to ' + WIN_SCORE + ' hits wins.',
+    width: W,
+    height: H,
+    players: [{ name: 'Blue', color: COLORS[0], side: 'left' }, { name: 'Pink', color: COLORS[1], side: 'right' }],
+    controls: {
+      cpu: 'WASD or arrows to drive · Space to fire\nTouch: drag left side to drive, tap right side to fire',
+      local: 'Blue WASD + Space · Pink arrows + Enter',
+      online: 'WASD or arrows · Space / Enter to fire · touch: drag left, tap right'
+    },
+    sounds: {
+      fire: [900, 0.07, 'square', 0.05, 300],
+      bounce: [500, 0.03, 'triangle', 0.04],
+      boom: [120, 0.6, 'sawtooth', 0.1, 30],
+      go: [660, 0.15, 'triangle', 0.08],
+      win: [440, 0.6, 'triangle', 0.09, 880]
+    },
+
+    init: function () {
+      var s = { score: [0, 0], map: (Math.random() * MAPS.length) | 0, round: 1 };
+      newRound(s);
+      return s;
+    },
+
+    readInput: function (inp) {
+      var out = {
+        t: (inp.held('right') ? 1 : 0) - (inp.held('left') ? 1 : 0),
+        m: (inp.held('up') ? 1 : 0) - (inp.held('down') ? 1 : 0),
+        f: inp.held('fire') ? 1 : 0,
+        a: null, am: 0
+      };
+      if (inp.scheme === 'any') {
+        inp.pointers.forEach(function (p) {
+          if (p.sx < W / 2) {
+            var dx = p.x - p.sx, dy = p.y - p.sy, len = Math.hypot(dx, dy);
+            if (len > 12) { out.a = U.round(Math.atan2(dy, dx), 100); out.am = U.round(Math.min(1, len / 60), 100); }
+          } else out.f = 1;
+        });
+      }
+      return out;
+    },
+
+    ai: function (s, i, dt) {
+      var me = s.tanks[i], o = s.tanks[1 - i], map = MAPS[s.map];
+      var mem = s.ai || (s.ai = { path: null, repath: 0, noise: 0, fireCd: 0 });
+      mem.repath -= dt;
+      mem.fireCd -= dt;
+      var out = { t: 0, m: 0, f: 0, a: null, am: 0 };
+      if (!me.alive || !o.alive) return out;
+      var dist = Math.hypot(o.x - me.x, o.y - me.y);
+      if (lineOfSight(map, me.x, me.y, o.x, o.y)) {
+        // Lead the target a little and wobble the aim so the CPU is beatable.
+        var lead = dist / BULLET_SPEED * 0.7;
+        if (Math.random() < 0.02) mem.noise = (Math.random() - 0.5) * 0.18;
+        var want = Math.atan2(o.y + o.vy * lead - me.y, o.x + o.vx * lead - me.x) + mem.noise;
+        var diff = Math.atan2(Math.sin(want - me.a), Math.cos(want - me.a));
+        out.t = Math.abs(diff) < 0.03 ? 0 : diff > 0 ? 1 : -1;
+        out.m = dist > 260 ? 1 : dist < 140 ? -1 : 0;
+        if (Math.abs(diff) < 0.09 && mem.fireCd <= 0) { out.f = 1; mem.fireCd = 0.6; }
+        mem.path = null;
+        return out;
+      }
+      if (!mem.path || mem.repath <= 0) {
+        mem.path = findPath(s.map, me.x, me.y, o.x, o.y);
+        mem.repath = 0.5;
+      }
+      var p = mem.path;
+      while (p && p.length && Math.hypot(p[0].x - me.x, p[0].y - me.y) < GS * 0.6) p.shift();
+      if (p && p.length) {
+        var wa = Math.atan2(p[0].y - me.y, p[0].x - me.x);
+        var d2 = Math.atan2(Math.sin(wa - me.a), Math.cos(wa - me.a));
+        out.t = Math.abs(d2) < 0.05 ? 0 : d2 > 0 ? 1 : -1;
+        out.m = Math.abs(d2) < 0.6 ? 1 : 0;
+      }
+      return out;
+    },
+
+    step: function (s, inputs, dt, api) {
+      var map = MAPS[s.map];
+      if (s.pause > 0) {
+        s.pause -= dt;
+        if (s.boom) s.boom.t += dt;
+        if (s.pause <= 0 && def.winner(s) === null) {
+          s.round++;
+          s.map = (s.map + 1) % MAPS.length;
+          if (s.ai) s.ai.path = null;
+          newRound(s);
+        }
+        return;
+      }
+
+      s.tanks.forEach(function (t, i) {
+        var inp = inputs[i] || {};
+        var ox = t.x, oy = t.y;
+        t.cd = Math.max(0, t.cd - dt);
+        if (inp.a !== null && inp.a !== undefined) {
+          var diff = Math.atan2(Math.sin(inp.a - t.a), Math.cos(inp.a - t.a));
+          t.a += U.clamp(diff, -TURN_SPEED * dt, TURN_SPEED * dt);
+          var go = U.clamp(inp.am || 0, 0, 1) * (Math.abs(diff) < 1.2 ? 1 : 0.2);
+          t.x += Math.cos(t.a) * TANK_SPEED * go * dt;
+          t.y += Math.sin(t.a) * TANK_SPEED * go * dt;
+        } else {
+          t.a += U.clamp(inp.t || 0, -1, 1) * TURN_SPEED * dt;
+          var m = U.clamp(inp.m || 0, -1, 1);
+          var sp = TANK_SPEED * (m < 0 ? 0.6 : 1) * m;
+          t.x += Math.cos(t.a) * sp * dt;
+          t.y += Math.sin(t.a) * sp * dt;
+        }
+        t.a = Math.atan2(Math.sin(t.a), Math.cos(t.a));
+        pushOutOfWalls(map, t);
+        t.vx = (t.x - ox) / dt;
+        t.vy = (t.y - oy) / dt;
+
+        var mine = s.bullets.filter(function (b) { return b.o === i; }).length;
+        if (inp.f && t.cd <= 0 && mine < MAX_BULLETS) {
+          var bx = t.x + Math.cos(t.a) * (TANK_R + 8), by = t.y + Math.sin(t.a) * (TANK_R + 8);
+          if (!hitsWalls(map, bx, by, BULLET_R)) {
+            s.bullets.push({ id: nextBulletId++, o: i, x: bx, y: by, vx: Math.cos(t.a) * BULLET_SPEED, vy: Math.sin(t.a) * BULLET_SPEED, life: BULLET_LIFE, bounces: 0 });
+            api.sfx('fire');
+          }
+          t.cd = FIRE_CD;
+        }
+      });
+
+      // Tanks shove each other apart.
+      var a = s.tanks[0], b = s.tanks[1];
+      var dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy);
+      if (d < TANK_R * 2 && d > 0) {
+        var push = (TANK_R * 2 - d) / 2;
+        a.x -= dx / d * push; a.y -= dy / d * push;
+        b.x += dx / d * push; b.y += dy / d * push;
+        pushOutOfWalls(map, a); pushOutOfWalls(map, b);
+      }
+
+      // Bullets: move one axis at a time so each wall hit reflects cleanly.
+      var alive = [];
+      s.bullets.forEach(function (bl) {
+        bl.life -= dt;
+        var steps = 3, dead = false;
+        for (var k = 0; k < steps && !dead; k++) {
+          bl.x += bl.vx * dt / steps;
+          if (hitsWalls(map, bl.x, bl.y, BULLET_R)) { bl.x -= bl.vx * dt / steps; bl.vx = -bl.vx; bl.bounces++; api.sfx('bounce'); }
+          bl.y += bl.vy * dt / steps;
+          if (hitsWalls(map, bl.x, bl.y, BULLET_R)) { bl.y -= bl.vy * dt / steps; bl.vy = -bl.vy; bl.bounces++; api.sfx('bounce'); }
+          if (bl.bounces > BULLET_BOUNCES || bl.life <= 0) dead = true;
+          for (var ti = 0; ti < 2 && !dead; ti++) {
+            var t = s.tanks[ti];
+            if (ti === bl.o && bl.bounces === 0) continue; // can't shoot yourself point-blank
+            if (Math.hypot(t.x - bl.x, t.y - bl.y) < TANK_R + BULLET_R) {
+              dead = true;
+              t.alive = false;
+              s.roundWinner = 1 - ti;
+              s.score[1 - ti]++;
+              s.pause = ROUND_PAUSE;
+              s.boom = { x: t.x, y: t.y, t: 0, p: ti };
+              api.sfx('boom');
+            }
+          }
+        }
+        if (!dead) alive.push(bl);
+      });
+      // Bullets that meet cancel out.
+      for (var i = 0; i < alive.length; i++) for (var j = i + 1; j < alive.length; j++) {
+        if (alive[i].o !== alive[j].o && !alive[i].gone && !alive[j].gone &&
+            Math.hypot(alive[i].x - alive[j].x, alive[i].y - alive[j].y) < BULLET_R * 2) {
+          alive[i].gone = alive[j].gone = true;
+        }
+      }
+      s.bullets = s.pause > 0 ? [] : alive.filter(function (bl) { return !bl.gone; });
+    },
+
+    winner: function (s) {
+      if (s.pause > ROUND_PAUSE - 0.9) return null;
+      if (s.score[0] >= WIN_SCORE) return 0;
+      if (s.score[1] >= WIN_SCORE) return 1;
+      return null;
+    },
+
+    snapshot: function (s) {
+      return {
+        t: s.tanks.map(function (t) { return [U.round(t.x), U.round(t.y), U.round(t.a, 100), t.alive ? 1 : 0]; }),
+        b: s.bullets.map(function (b) { return [b.id, U.round(b.x), U.round(b.y), b.o]; }),
+        sc: s.score, mp: s.map, pz: U.round(s.pause, 100), rw: s.roundWinner,
+        bm: s.boom ? [U.round(s.boom.x), U.round(s.boom.y), U.round(s.boom.t, 100), s.boom.p] : null
+      };
+    },
+    applySnapshot: function (prev, n) {
+      return {
+        tanks: n.t.map(function (t) { return { x: t[0], y: t[1], a: t[2], alive: !!t[3] }; }),
+        bullets: n.b.map(function (b) { return { id: b[0], x: b[1], y: b[2], o: b[3] }; }),
+        score: n.sc, map: n.mp, pause: n.pz, roundWinner: n.rw,
+        boom: n.bm ? { x: n.bm[0], y: n.bm[1], t: n.bm[2], p: n.bm[3] } : null
+      };
+    },
+    interpolate: function (a, b, t) {
+      if (a.map !== b.map) return b;
+      var byId = {};
+      a.bullets.forEach(function (bl) { byId[bl.id] = bl; });
+      return {
+        tanks: b.tanks.map(function (tb, i) {
+          var ta = a.tanks[i];
+          return { x: U.lerp(ta.x, tb.x, t), y: U.lerp(ta.y, tb.y, t), a: U.lerpAngle(ta.a, tb.a, t), alive: tb.alive };
+        }),
+        bullets: b.bullets.map(function (bb) {
+          var ba = byId[bb.id];
+          return ba ? { id: bb.id, x: U.lerp(ba.x, bb.x, t), y: U.lerp(ba.y, bb.y, t), o: bb.o } : bb;
+        }),
+        score: b.score, map: b.map, pause: b.pause, roundWinner: b.roundWinner,
+        boom: b.boom
+      };
+    },
+
+    render: function (ctx, s, view) {
+      ctx.fillStyle = '#070912';
+      ctx.fillRect(0, 0, W, H);
+      ctx.strokeStyle = 'rgba(90,120,255,0.06)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      for (var x = 0; x <= W; x += 40) { ctx.moveTo(x + 0.5, 0); ctx.lineTo(x + 0.5, H); }
+      for (var y = 0; y <= H; y += 40) { ctx.moveTo(0, y + 0.5); ctx.lineTo(W, y + 0.5); }
+      ctx.stroke();
+
+      ctx.save();
+      U.glow(ctx, '#7a5cff', 14);
+      ctx.fillStyle = '#1a1640';
+      ctx.strokeStyle = '#9a85ff';
+      ctx.lineWidth = 2;
+      MAPS[s.map].forEach(function (w) {
+        ctx.fillRect(w[0], w[1], w[2], w[3]);
+        ctx.strokeRect(w[0] + 1, w[1] + 1, w[2] - 2, w[3] - 2);
+      });
+      ctx.restore();
+      ctx.strokeStyle = 'rgba(150,130,255,0.5)';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(1.5, 1.5, W - 3, H - 3);
+
+      s.tanks.forEach(function (t, i) {
+        if (!t.alive) return;
+        ctx.save();
+        ctx.translate(t.x, t.y);
+        ctx.rotate(t.a);
+        U.glow(ctx, COLORS[i], 16);
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(-17, -15, 34, 7);
+        ctx.fillRect(-17, 8, 34, 7);
+        ctx.fillStyle = COLORS[i];
+        ctx.fillRect(-14, -11, 28, 22);
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = 'rgba(0,0,0,0.3)';
+        ctx.beginPath(); ctx.arc(0, 0, 8, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillRect(4, -2.5, 20, 5);
+        ctx.restore();
+        if ((view.mode === 'host' || view.mode === 'guest') && i === view.me && view.phase === 'countdown') {
+          ctx.fillStyle = COLORS[i];
+          ctx.font = '600 13px system-ui,sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('YOU', t.x, t.y - 26);
+        }
+      });
+
+      s.bullets.forEach(function (b) {
+        ctx.save();
+        U.glow(ctx, COLORS[b.o], 12);
+        ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(b.x, b.y, BULLET_R, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+      });
+
+      if (s.boom) {
+        var k = Math.min(1, s.boom.t / 0.7);
+        ctx.save();
+        U.glow(ctx, COLORS[s.boom.p], 30);
+        ctx.strokeStyle = COLORS[s.boom.p];
+        ctx.globalAlpha = 1 - k;
+        ctx.lineWidth = 4;
+        ctx.beginPath(); ctx.arc(s.boom.x, s.boom.y, 10 + k * 60, 0, Math.PI * 2); ctx.stroke();
+        for (var p = 0; p < 10; p++) {
+          var ang = p / 10 * Math.PI * 2;
+          ctx.fillStyle = p % 2 ? '#fff' : COLORS[s.boom.p];
+          ctx.fillRect(s.boom.x + Math.cos(ang) * k * 50 - 2, s.boom.y + Math.sin(ang) * k * 50 - 2, 4, 4);
+        }
+        ctx.restore();
+      }
+    },
+
+    hud: function (ctx, s, view) {
+      ctx.font = '700 22px system-ui,sans-serif';
+      ctx.textBaseline = 'top';
+      ctx.textAlign = 'left';
+      ctx.fillStyle = COLORS[0];
+      ctx.fillText(view.players[0].name + '  ' + s.score[0], 14, 10);
+      ctx.textAlign = 'right';
+      ctx.fillStyle = COLORS[1];
+      ctx.fillText(s.score[1] + '  ' + view.players[1].name, W - 14, 46);
+      if (s.pause > 0 && s.roundWinner !== null) {
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.font = '700 30px system-ui,sans-serif';
+        ctx.fillStyle = COLORS[s.roundWinner];
+        ctx.fillText(view.players[s.roundWinner].name + ' scores!', W / 2, H / 2);
+      }
+    }
+  };
+
+  GameShell.start(def, '#game');
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Neon Air Hockey</title>
+<style>html,body{margin:0;height:100%;background:#05060d}#game{position:fixed;inset:0}</style>
+</head>
+<body>
+<div id="game"></div>
+<script src="../lib/p2p.js"></script>
+<script src="../lib/shell.js"></script>
+<script>
+(function () {
+  'use strict';
+  var U = GameShell.utils;
+  var W = 480, H = 800;
+  var MALLET_R = 34, PUCK_R = 22, GOAL_W = 170;
+  var POINTER_SPEED = 2200, KEY_SPEED = 650;
+  var PUCK_MAX = 1500, RESTITUTION = 0.9, WALL_BOUNCE = 0.88, FRICTION = 0.7;
+  var WIN_SCORE = 7;
+  var COLORS = ['#3cf', '#f4a'];
+  var SUBSTEPS = 6;
+
+  function home(i) { return { x: W / 2, y: i === 0 ? H - 110 : 110 }; }
+
+  function resetPuck(s, conceder) {
+    s.puck = { x: W / 2, y: conceder === 0 ? H / 2 + 120 : conceder === 1 ? H / 2 - 120 : H / 2, vx: 0, vy: 0 };
+    s.pauseIn = 0.8;
+  }
+
+  // Clamp a mallet to its own half of the table.
+  function clampMallet(m, i) {
+    m.x = U.clamp(m.x, MALLET_R, W - MALLET_R);
+    m.y = i === 0 ? U.clamp(m.y, H / 2 + MALLET_R, H - MALLET_R) : U.clamp(m.y, MALLET_R, H / 2 - MALLET_R);
+  }
+
+  function targetFor(m, inp, dt) {
+    if (!inp) return { x: m.x, y: m.y };
+    if (inp.tx !== null && inp.tx !== undefined) {
+      var speed = POINTER_SPEED * U.clamp(inp.s === undefined ? 1 : inp.s, 0, 1) * dt;
+      var dx = inp.tx - m.x, dy = inp.ty - m.y, d = Math.hypot(dx, dy);
+      if (d <= speed) return { x: inp.tx, y: inp.ty };
+      return { x: m.x + dx / d * speed, y: m.y + dy / d * speed };
+    }
+    var kx = U.clamp(inp.dx || 0, -1, 1), ky = U.clamp(inp.dy || 0, -1, 1);
+    var len = Math.hypot(kx, ky) || 1;
+    return { x: m.x + kx / len * KEY_SPEED * dt, y: m.y + ky / len * KEY_SPEED * dt };
+  }
+
+  function collide(s, m, i, mvx, mvy, api) {
+    var p = s.puck;
+    var dx = p.x - m.x, dy = p.y - m.y, d = Math.hypot(dx, dy);
+    var min = MALLET_R + PUCK_R;
+    if (d >= min) return;
+    var nx = d > 0 ? dx / d : 0, ny = d > 0 ? dy / d : (i === 0 ? -1 : 1);
+    p.x = m.x + nx * min;
+    p.y = m.y + ny * min;
+    var rvx = p.vx - mvx, rvy = p.vy - mvy;
+    var vn = rvx * nx + rvy * ny;
+    if (vn < 0) {
+      p.vx -= (1 + RESTITUTION) * vn * nx;
+      p.vy -= (1 + RESTITUTION) * vn * ny;
+      var sp = Math.hypot(p.vx, p.vy);
+      if (sp > PUCK_MAX) { p.vx *= PUCK_MAX / sp; p.vy *= PUCK_MAX / sp; }
+      if (-vn > 120) { s.flash[i] = 1; api.sfx('hit'); }
+    }
+  }
+
+  var def = {
+    id: 'airhockey',
+    title: 'Neon Air Hockey',
+    tagline: 'First to ' + WIN_SCORE + ' goals wins.',
+    width: W,
+    height: H,
+    flipP2: true,
+    mouseHover: true,
+    players: [{ name: 'Blue', color: COLORS[0], side: 'bottom' }, { name: 'Pink', color: COLORS[1], side: 'top' }],
+    controls: {
+      cpu: 'Mouse or touch (WASD / arrows also work)',
+      local: 'Each player touches their half · or Blue WASD, Pink arrows',
+      online: 'Mouse or touch (WASD / arrows also work)'
+    },
+    sounds: {
+      hit: [700, 0.05, 'square', 0.06],
+      wall: [380, 0.04, 'triangle', 0.06],
+      goal: [200, 0.5, 'sawtooth', 0.07, 60],
+      go: [660, 0.15, 'triangle', 0.08],
+      win: [440, 0.6, 'triangle', 0.09, 880]
+    },
+
+    init: function () {
+      var s = { m: [home(0), home(1)], score: [0, 0], flash: [0, 0] };
+      resetPuck(s, null);
+      return s;
+    },
+
+    readInput: function (inp) {
+      var dx = (inp.held('right') ? 1 : 0) - (inp.held('left') ? 1 : 0);
+      var dy = (inp.held('down') ? 1 : 0) - (inp.held('up') ? 1 : 0);
+      // The online guest sees the table rotated, so their keys are too.
+      if (inp.mode === 'guest') { dx = -dx; dy = -dy; }
+      var t = null;
+      for (var i = 0; i < inp.pointers.length; i++) {
+        var p = inp.pointers[i];
+        if (inp.scheme === 'p1' && p.y < H / 2) continue;
+        if (inp.scheme === 'p2' && p.y > H / 2) continue;
+        t = p;
+      }
+      if (dx || dy || !t) return { tx: null, ty: null, dx: dx, dy: dy };
+      return { tx: Math.round(t.x), ty: Math.round(t.y), dx: 0, dy: 0 };
+    },
+
+    ai: function (s, i) {
+      var p = s.puck, m = s.m[i];
+      var goalY = i === 1 ? 0 : H, oppY = i === 1 ? H : 0, sign = i === 1 ? 1 : -1;
+      var mine = i === 1 ? p.y < H / 2 : p.y > H / 2;
+      var tx, ty, speed = 0.42;
+      if (mine && (p.vy * sign < 260)) {
+        var behind = (p.y - m.y) * sign > 8;
+        if (behind) {
+          // Strike through the puck toward the opponent's goal.
+          var ax = W / 2 + (Math.random() - 0.5) * 60 - p.x, ay = oppY - p.y;
+          var al = Math.hypot(ax, ay);
+          tx = p.x + ax / al * 40;
+          ty = p.y + ay / al * 40;
+          speed = 0.5;
+        } else {
+          // Get back around to the goal side of the puck.
+          tx = p.x + (p.x < W / 2 ? 70 : -70);
+          ty = p.y - sign * 70;
+        }
+      } else {
+        // Guard the goal, shading toward the puck.
+        tx = W / 2 + (p.x - W / 2) * 0.45;
+        ty = goalY + sign * 105;
+      }
+      return { tx: tx, ty: ty, dx: 0, dy: 0, s: speed };
+    },
+
+    step: function (s, inputs, dt, api) {
+      s.flash[0] = Math.max(0, s.flash[0] - dt * 4);
+      s.flash[1] = Math.max(0, s.flash[1] - dt * 4);
+      var from = [], to = [];
+      for (var i = 0; i < 2; i++) {
+        from[i] = { x: s.m[i].x, y: s.m[i].y };
+        to[i] = targetFor(s.m[i], inputs[i], dt);
+        clampMallet(to[i], i);
+      }
+      var p = s.puck;
+      if (s.pauseIn > 0) {
+        s.pauseIn -= dt;
+        s.m[0] = to[0]; s.m[1] = to[1];
+        return;
+      }
+      var h = dt / SUBSTEPS;
+      for (var k = 1; k <= SUBSTEPS; k++) {
+        var t = k / SUBSTEPS;
+        for (i = 0; i < 2; i++) {
+          s.m[i] = { x: U.lerp(from[i].x, to[i].x, t), y: U.lerp(from[i].y, to[i].y, t) };
+        }
+        p.x += p.vx * h;
+        p.y += p.vy * h;
+        for (i = 0; i < 2; i++) {
+          collide(s, s.m[i], i, (to[i].x - from[i].x) / dt, (to[i].y - from[i].y) / dt, api);
+        }
+        var inMouth = Math.abs(p.x - W / 2) < GOAL_W / 2 - PUCK_R * 0.4;
+        if (p.x < PUCK_R) { p.x = PUCK_R; p.vx = Math.abs(p.vx) * WALL_BOUNCE; api.sfx('wall'); }
+        if (p.x > W - PUCK_R) { p.x = W - PUCK_R; p.vx = -Math.abs(p.vx) * WALL_BOUNCE; api.sfx('wall'); }
+        if (!inMouth || (p.y > PUCK_R && p.y < H - PUCK_R)) {
+          if (p.y < PUCK_R && p.y > -PUCK_R) { p.y = PUCK_R; p.vy = Math.abs(p.vy) * WALL_BOUNCE; api.sfx('wall'); }
+          if (p.y > H - PUCK_R && p.y < H + PUCK_R) { p.y = H - PUCK_R; p.vy = -Math.abs(p.vy) * WALL_BOUNCE; api.sfx('wall'); }
+        } else {
+          // Inside the goal mouth: the posts keep the puck in the slot.
+          p.x = U.clamp(p.x, W / 2 - GOAL_W / 2 + PUCK_R, W / 2 + GOAL_W / 2 - PUCK_R);
+        }
+        if (p.y < -PUCK_R) { s.score[0]++; api.sfx('goal'); resetPuck(s, 1); return; }
+        if (p.y > H + PUCK_R) { s.score[1]++; api.sfx('goal'); resetPuck(s, 0); return; }
+      }
+      var f = Math.pow(FRICTION, dt);
+      p.vx *= f; p.vy *= f;
+    },
+
+    winner: function (s) {
+      if (s.score[0] >= WIN_SCORE) return 0;
+      if (s.score[1] >= WIN_SCORE) return 1;
+      return null;
+    },
+
+    snapshot: function (s) {
+      return {
+        m: [U.round(s.m[0].x), U.round(s.m[0].y), U.round(s.m[1].x), U.round(s.m[1].y)],
+        p: [U.round(s.puck.x), U.round(s.puck.y)],
+        sc: s.score,
+        f: [U.round(s.flash[0], 100), U.round(s.flash[1], 100)]
+      };
+    },
+    applySnapshot: function (prev, n) {
+      return {
+        m: [{ x: n.m[0], y: n.m[1] }, { x: n.m[2], y: n.m[3] }],
+        puck: { x: n.p[0], y: n.p[1] },
+        score: n.sc, flash: n.f
+      };
+    },
+    interpolate: function (a, b, t) {
+      function lp(p, q) { return { x: U.lerp(p.x, q.x, t), y: U.lerp(p.y, q.y, t) }; }
+      var jump = Math.hypot(a.puck.x - b.puck.x, a.puck.y - b.puck.y) > 120;
+      return { m: [lp(a.m[0], b.m[0]), lp(a.m[1], b.m[1])], puck: jump ? b.puck : lp(a.puck, b.puck), score: b.score, flash: b.flash };
+    },
+
+    render: function (ctx, s) {
+      ctx.fillStyle = '#070a18';
+      ctx.fillRect(0, 0, W, H);
+      ctx.strokeStyle = 'rgba(140,170,255,0.25)';
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(0, H / 2); ctx.lineTo(W, H / 2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(W / 2, H / 2, 70, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(W / 2, 0, 110, 0, Math.PI); ctx.stroke();
+      ctx.beginPath(); ctx.arc(W / 2, H, 110, Math.PI, Math.PI * 2); ctx.stroke();
+
+      // Rails and goal slots.
+      ctx.save();
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = '#8af';
+      U.glow(ctx, '#58f', 14);
+      ctx.strokeRect(3, 3, W - 6, H - 6);
+      ctx.restore();
+      for (var g = 0; g < 2; g++) {
+        ctx.save();
+        ctx.fillStyle = COLORS[g === 0 ? 1 : 0];
+        U.glow(ctx, ctx.fillStyle, 20);
+        ctx.fillRect(W / 2 - GOAL_W / 2, g === 0 ? 0 : H - 8, GOAL_W, 8);
+        ctx.restore();
+      }
+
+      for (var i = 0; i < 2; i++) {
+        var m = s.m[i];
+        ctx.save();
+        U.glow(ctx, COLORS[i], 20 + s.flash[i] * 30);
+        ctx.fillStyle = COLORS[i];
+        ctx.beginPath(); ctx.arc(m.x, m.y, MALLET_R, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+        ctx.fillStyle = 'rgba(0,0,0,0.35)';
+        ctx.beginPath(); ctx.arc(m.x, m.y, MALLET_R * 0.62, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = COLORS[i];
+        ctx.beginPath(); ctx.arc(m.x, m.y, MALLET_R * 0.36, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.save();
+      U.glow(ctx, '#ffe066', 22);
+      ctx.fillStyle = '#ffe066';
+      ctx.beginPath(); ctx.arc(s.puck.x, s.puck.y, PUCK_R, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    },
+
+    hud: function (ctx, s, view) {
+      // Scores sit by the side rail: the bottom number is whoever plays at the bottom.
+      var bottom = view.flip ? 1 : 0;
+      ctx.font = '700 44px system-ui,sans-serif';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      ctx.fillStyle = COLORS[bottom];
+      ctx.globalAlpha = 0.55;
+      ctx.fillText(s.score[bottom], W - 18, H / 2 + 40);
+      ctx.fillStyle = COLORS[1 - bottom];
+      ctx.fillText(s.score[1 - bottom], W - 18, H / 2 - 40);
+    }
+  };
+
+  GameShell.start(def, '#game');
+})();
+</script>
+</body>
+</html>
